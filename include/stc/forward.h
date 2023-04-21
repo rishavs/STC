@@ -101,7 +101,7 @@ typedef union {
         SELF##_node *last; \
     } SELF
 
-typedef struct { uint8_t hashx, psl; } chash_slot;
+typedef struct { uint8_t hashx, dist; } chash_slot;
 
 #define _c_chash_types(SELF, KEY, VAL, MAP_ONLY, SET_ONLY) \
     typedef KEY SELF##_key; \

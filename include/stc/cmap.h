@@ -24,7 +24,7 @@
 // Unordered set/map - implemented as closed hashing with linear probing and no tombstones.
 // https://programming.guide/robin-hood-hashing.html
 // https://www.sebastiansylvan.com/post/robin-hood-hashing-should-be-your-default-hash-table-implementation
-// Uses probe sequence lengths (psl)
+// Uses probe sequence lengths (dist)
 /*
 #include <stdio.h>
 
@@ -56,7 +56,7 @@ int main(void) {
 #include "forward.h"
 #include <stdlib.h>
 #include <string.h>
-typedef struct { intptr_t idx; uint8_t hashx, psl, found; } chash_bucket;
+typedef struct { intptr_t idx; uint8_t hashx, dist, found; } chash_bucket;
 #endif // CMAP_H_INCLUDED
 
 #ifndef _i_prefix
@@ -127,7 +127,7 @@ STC_INLINE bool         _cx_memb(_contains)(const _cx_self* self, _cx_keyraw rke
     STC_INLINE const _cx_mapped*
     _cx_memb(_at)(const _cx_self* self, _cx_keyraw rkey) {
         chash_bucket b = _cx_memb(_bucket_)(self, &rkey);
-        assert(self->slot[b.idx].hashx);
+        assert(b.found);
         return &self->data[b.idx].second;
     }
     STC_INLINE _cx_mapped*
@@ -238,19 +238,19 @@ _cx_memb(_advance)(_cx_iter it, size_t n) {
 
 STC_INLINE _cx_iter
 _cx_memb(_find)(const _cx_self* self, _cx_keyraw rkey) {
-    intptr_t idx;
-    if (self->size && self->slot[idx = _cx_memb(_bucket_)(self, &rkey).idx].hashx)
-        return c_LITERAL(_cx_iter){self->data + idx, 
+    chash_bucket b;
+    if (self->size && (b = _cx_memb(_bucket_)(self, &rkey)).found)
+        return c_LITERAL(_cx_iter){self->data + b.idx, 
                                    self->data + self->bucket_count,
-                                   self->slot + idx};
+                                   self->slot + b.idx};
     return _cx_memb(_end)(self);
 }
 
 STC_INLINE const _cx_value*
 _cx_memb(_get)(const _cx_self* self, _cx_keyraw rkey) {
-    intptr_t idx;
-    if (self->size && self->slot[idx = _cx_memb(_bucket_)(self, &rkey).idx].hashx)
-        return self->data + idx;
+    chash_bucket b;
+    if (self->size && (b = _cx_memb(_bucket_)(self, &rkey)).found)    
+        return self->data + b.idx;
     return NULL;
 }
 
@@ -260,10 +260,9 @@ _cx_memb(_get_mut)(_cx_self* self, _cx_keyraw rkey)
 
 STC_INLINE int
 _cx_memb(_erase)(_cx_self* self, _cx_keyraw rkey) {
-    if (self->size == 0)
-        return 0;
+    if (self->size == 0) return 0;
     chash_bucket b = _cx_memb(_bucket_)(self, &rkey);
-    return self->slot[b.idx].hashx ? _cx_memb(_erase_entry)(self, self->data + b.idx), 1 : 0;
+    return b.found ? _cx_memb(_erase_entry)(self, self->data + b.idx), 1 : 0;
 }
 
 STC_INLINE _cx_iter
@@ -368,14 +367,13 @@ _cx_memb(_bucket_)(const _cx_self* self, const _cx_keyraw* rkeyptr) {
     chash_bucket b = {c_PASTE(fastrange_,i_expandby)(_hash, (uint64_t)_cap), (uint8_t)(_hash | 0x80)};
     //printf("key %d: pos:%d (initial)\n", *rkeyptr, (int)b.idx);
     const chash_slot* s = self->slot;
-    for (; s[b.idx].hashx && b.psl <= s[b.idx].psl; ++b.psl) {
+
+    for (; s[b.idx].hashx && b.dist <= s[b.idx].dist; ++b.dist) {
         if (s[b.idx].hashx == b.hashx) {
             const _cx_keyraw _raw = i_keyto(_i_keyref(self->data + b.idx));
-            if (i_eq((&_raw), rkeyptr))
-                { b.found = true; break; }
+            if (i_eq((&_raw), rkeyptr)) { b.found = true; break; }
         }
-        if (++b.idx == _cap)
-            b.idx = 0;
+        if (++b.idx == _cap) b.idx = 0;
     }
     return b;
 }
@@ -388,27 +386,29 @@ _cx_memb(_insert_entry_)(_cx_self* self, _cx_keyraw rkey) {
             return res;
 
     chash_bucket b = _cx_memb(_bucket_)(self, &rkey);
-    //printf("key %d: pos:%d, psl:%d\n", rkey, (int)b.idx, b.psl);
+    //printf("key %d: pos:%d, dist:%d\n", rkey, (int)b.idx, b.dist);
     res.ref = &self->data[b.idx];
-    if (!b.found) {
-        res.inserted = true; ++self->size;
-        chash_slot *s = self->slot, scur = s[b.idx];
-        s[b.idx] = (chash_slot){b.hashx, b.psl};
-        if (scur.hashx) {
-            _cx_value vcur = self->data[b.idx];
-            for (;;) {
-                ++scur.psl;
-                if (++b.idx == self->bucket_count) b.idx = 0;
-                if (!s[b.idx].hashx) break;
-                if (s[b.idx].psl < scur.psl) {
-                    c_swap(chash_slot, &scur, s + b.idx);
-                    c_swap(_cx_value, &vcur, self->data + b.idx);
-                }
-            }
-            self->data[b.idx] = vcur;
-            s[b.idx] = scur;
+    if (b.found)
+        return res;
+
+    ++self->size; res.inserted = true;
+    chash_slot *s = self->slot, scur = s[b.idx];
+    s[b.idx] = (chash_slot){b.hashx, b.dist};
+    if (!scur.hashx)
+        return res;
+
+    _cx_value dcur = self->data[b.idx];
+    for (;;) {
+        ++scur.dist;
+        if (++b.idx == self->bucket_count) b.idx = 0;
+        if (!s[b.idx].hashx) break;
+        if (s[b.idx].dist < scur.dist) {
+            c_swap(chash_slot, &scur, &s[b.idx]);
+            c_swap(_cx_value, &dcur, &self->data[b.idx]);
         }
     }
+    self->data[b.idx] = dcur;
+    s[b.idx] = scur;
     return res;
 }
 
@@ -475,11 +475,11 @@ _cx_memb(_erase_entry)(_cx_self* self, _cx_value* _val) {
     _cx_memb(_value_drop)(_val);
     for (;;) { /* delete with backward shifting */
         if (++j == _cap) j = 0;
-        if (!s[j].psl | !s[j].hashx) break;
+        if (!s[j].dist | !s[j].hashx) break;
 
         d[i] = d[j]; s[i] = s[j]; i = j;
     }
-    s[i].hashx = 0, s[i].psl = 0;
+    s[i].hashx = 0, s[i].dist = 0;
     --self->size;
 }
 
