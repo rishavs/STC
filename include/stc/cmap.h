@@ -116,7 +116,7 @@ STC_INLINE intptr_t     _cx_memb(_bucket_count)(_cx_self* map) { return map->buc
 STC_INLINE intptr_t     _cx_memb(_capacity)(const _cx_self* map)
                             { return (intptr_t)((float)map->bucket_count * (i_max_load_factor)); }
 STC_INLINE bool         _cx_memb(_contains)(const _cx_self* self, _cx_keyraw rkey)
-                            { return self->size && self->slot[_cx_memb(_bucket_)(self, &rkey).idx].hashx; }
+                            { return self->size && _cx_memb(_bucket_)(self, &rkey).found; }
 
 #ifndef _i_isset
     STC_API _cx_result _cx_memb(_insert_or_assign)(_cx_self* self, i_key key, i_val mapped);
@@ -365,43 +365,34 @@ _cx_memb(_bucket_)(const _cx_self* self, const _cx_keyraw* rkeyptr) {
     const uint64_t _hash = i_hash(rkeyptr);
     int64_t _cap = self->bucket_count;
     chash_bucket b = {c_PASTE(fastrange_,i_expandby)(_hash, (uint64_t)_cap), (uint8_t)(_hash | 0x80)};
-    //printf("key %d: pos:%d (initial)\n", *rkeyptr, (int)b.idx);
     const chash_slot* s = self->slot;
 
-    for (; s[b.idx].hashx && b.dist <= s[b.idx].dist; ++b.dist) {
+    while (s[b.idx].hashx && b.dist <= s[b.idx].dist) {
         if (s[b.idx].hashx == b.hashx) {
             const _cx_keyraw _raw = i_keyto(_i_keyref(self->data + b.idx));
-            if (i_eq((&_raw), rkeyptr)) { b.found = true; break; }
+            if (i_eq((&_raw), rkeyptr)) { 
+                b.found = true; 
+                break;
+            }
         }
         if (++b.idx == _cap) b.idx = 0;
     }
     return b;
 }
 
-STC_DEF _cx_result
-_cx_memb(_insert_entry_)(_cx_self* self, _cx_keyraw rkey) {
-    _cx_result res = {NULL};
-    if (self->size + 2 > (intptr_t)((float)self->bucket_count * (i_max_load_factor)))
-        if (!_cx_memb(_reserve)(self, (intptr_t)(self->size*3/2)))
-            return res;
-
-    chash_bucket b = _cx_memb(_bucket_)(self, &rkey);
-    //printf("key %d: pos:%d, dist:%d\n", rkey, (int)b.idx, b.dist);
-    res.ref = &self->data[b.idx];
-    if (b.found)
-        return res;
-
-    ++self->size; res.inserted = true;
+STC_DEF void
+_cx_memb(_insert_bucket_)(_cx_self* self, chash_bucket b) {
     chash_slot *s = self->slot, scur = s[b.idx];
     s[b.idx] = (chash_slot){b.hashx, b.dist};
     if (!scur.hashx)
-        return res;
+        return;
 
     _cx_value dcur = self->data[b.idx];
     for (;;) {
         ++scur.dist;
         if (++b.idx == self->bucket_count) b.idx = 0;
-        if (!s[b.idx].hashx) break;
+        if (!s[b.idx].hashx)
+            break;
         if (s[b.idx].dist < scur.dist) {
             c_swap(chash_slot, &scur, &s[b.idx]);
             c_swap(_cx_value, &dcur, &self->data[b.idx]);
@@ -409,6 +400,25 @@ _cx_memb(_insert_entry_)(_cx_self* self, _cx_keyraw rkey) {
     }
     self->data[b.idx] = dcur;
     s[b.idx] = scur;
+}
+
+STC_DEF _cx_result
+_cx_memb(_insert_entry_)(_cx_self* self, _cx_keyraw rkey) {
+    _cx_result res = {NULL};
+    if (self->size + 2 > (intptr_t)((float)self->bucket_count*(i_max_load_factor))) {
+        if (!_cx_memb(_reserve)(self, (intptr_t)(self->size*3/2)))
+            return res;
+    }
+
+    chash_bucket b = _cx_memb(_bucket_)(self, &rkey);
+    //printf("key %d: pos:%d (initial)\n", *rkeyptr, (int)b.idx);
+    res.ref = &self->data[b.idx];
+    if (!b.found) {
+        _cx_memb(_insert_bucket_)(self, b);
+        ++self->size;
+        res.inserted = true;
+    }
+    //printf("key %d: pos:%d, dist:%d\n", rkey, (int)b.idx, b.dist);
     return res;
 }
 
@@ -456,8 +466,8 @@ _cx_memb(_reserve)(_cx_self* self, const intptr_t _newcap) {
         for (intptr_t i = 0; i < _oldbucks; ++i, ++d) if ((s++)->hashx) {
             _cx_keyraw r = i_keyto(_i_keyref(d));
             chash_bucket b = _cx_memb(_bucket_)(&m, &r);
+            _cx_memb(_insert_bucket_)(&m, b);
             m.data[b.idx] = *d; // move
-            m.slot[b.idx].hashx = b.hashx;
         }
         c_swap(_cx_self, self, &m);
     }
@@ -473,13 +483,16 @@ _cx_memb(_erase_entry)(_cx_self* self, _cx_value* _val) {
     intptr_t i = _val - d, j = i;
     const intptr_t _cap = self->bucket_count;
     _cx_memb(_value_drop)(_val);
-    for (;;) { /* delete with backward shifting */
+    for (;;) { // delete with backward shifting
         if (++j == _cap) j = 0;
-        if (!s[j].dist | !s[j].hashx) break;
-
-        d[i] = d[j]; s[i] = s[j]; i = j;
+        if (!s[j].dist) // empty slots has dist=0 too
+            break;
+        d[i] = d[j];
+        s[i] = s[j];
+        --s[i].dist;
+        i = j;
     }
-    s[i].hashx = 0, s[i].dist = 0;
+    s[j].hashx = 0;
     --self->size;
 }
 
