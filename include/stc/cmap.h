@@ -74,10 +74,10 @@ typedef struct { intptr_t idx; uint8_t hashx, dist, found; } chash_bucket;
 #endif
 #define _i_ishash
 #ifndef i_max_load_factor
-  #define i_max_load_factor 0.85f
+  #define i_max_load_factor 0.82f
 #endif
-#ifndef i_expandby
-  #define i_expandby 1
+#ifndef i_sizebits
+  #define i_sizebits 32
 #endif
 #include "priv/template.h"
 #ifndef i_is_forward
@@ -260,9 +260,10 @@ _cx_memb(_get_mut)(_cx_self* self, _cx_keyraw rkey)
 
 STC_INLINE int
 _cx_memb(_erase)(_cx_self* self, _cx_keyraw rkey) {
-    if (self->size == 0) return 0;
-    chash_bucket b = _cx_memb(_bucket_)(self, &rkey);
-    return b.found ? _cx_memb(_erase_entry)(self, self->data + b.idx), 1 : 0;
+    chash_bucket b = {0};
+    if (self->size && (b = _cx_memb(_bucket_)(self, &rkey)).found)
+        _cx_memb(_erase_entry)(self, self->data + b.idx);
+    return b.found;
 }
 
 STC_INLINE _cx_iter
@@ -287,18 +288,12 @@ _cx_memb(_eq)(const _cx_self* self, const _cx_self* other) {
 #if defined(i_implement)
 
 #ifndef CMAP_H_INCLUDED
-STC_INLINE int64_t fastrange_1(uint64_t x, uint64_t n)
-    { return (int64_t)((uint32_t)x*n >> 32); } // n < 2^32
+STC_INLINE int64_t fastrange_32(uint64_t x, uint64_t n)
+    { return (int64_t)((uint32_t)x*n >> 32); } // n < 2^31
 
-STC_INLINE int64_t fastrange_2(uint64_t x, uint64_t n) 
-    { return (int64_t)(x & (n - 1)); } // n power of 2.
-
-STC_INLINE uint64_t next_power_of_2(uint64_t n) {
-    n--;
-    n |= n >>  1, n |= n >>  2;
-    n |= n >>  4, n |= n >>  8;
-    n |= n >> 16, n |= n >> 32;
-    return n + 1;
+STC_INLINE int64_t fastrange_64(uint64_t x, uint64_t n) {
+    uint64_t lo, hi; c_umul128(x, n, &lo, &hi);
+    return (int64_t)hi;
 }
 #endif // CMAP_H_INCLUDED
 
@@ -328,7 +323,7 @@ STC_DEF void _cx_memb(_drop)(_cx_self* self) {
 STC_DEF void _cx_memb(_clear)(_cx_self* self) {
     _cx_memb(_wipe_)(self);
     self->size = 0;
-    c_memset(self->slot, 0, sizeof(chash_slot)*self->bucket_count);
+    c_memset(self->slot, 0, c_sizeof(chash_slot)*self->bucket_count);
 }
 
 #ifndef _i_isset
@@ -363,19 +358,19 @@ STC_DEF void _cx_memb(_clear)(_cx_self* self) {
 STC_DEF chash_bucket
 _cx_memb(_bucket_)(const _cx_self* self, const _cx_keyraw* rkeyptr) {
     const uint64_t _hash = i_hash(rkeyptr);
-    int64_t _cap = self->bucket_count;
-    chash_bucket b = {c_PASTE(fastrange_,i_expandby)(_hash, (uint64_t)_cap), (uint8_t)(_hash | 0x80)};
+    intptr_t _cap = self->bucket_count;
+    chash_bucket b = {c_PASTE(fastrange_,i_sizebits)(_hash, (uint64_t)_cap), (uint8_t)(_hash | 0x80)};
     const chash_slot* s = self->slot;
-
     while (s[b.idx].hashx && b.dist <= s[b.idx].dist) {
         if (s[b.idx].hashx == b.hashx) {
             const _cx_keyraw _raw = i_keyto(_i_keyref(self->data + b.idx));
-            if (i_eq((&_raw), rkeyptr)) { 
+            if (i_eq((&_raw), rkeyptr)) {
                 b.found = true; 
                 break;
             }
         }
         if (++b.idx == _cap) b.idx = 0;
+        ++b.dist;
     }
     return b;
 }
@@ -405,20 +400,17 @@ _cx_memb(_insert_bucket_)(_cx_self* self, chash_bucket b) {
 STC_DEF _cx_result
 _cx_memb(_insert_entry_)(_cx_self* self, _cx_keyraw rkey) {
     _cx_result res = {NULL};
-    if (self->size + 2 > (intptr_t)((float)self->bucket_count*(i_max_load_factor))) {
+    if (self->size + 2 > (intptr_t)((float)self->bucket_count * (i_max_load_factor)))
         if (!_cx_memb(_reserve)(self, (intptr_t)(self->size*3/2)))
             return res;
-    }
 
     chash_bucket b = _cx_memb(_bucket_)(self, &rkey);
-    //printf("key %d: pos:%d (initial)\n", *rkeyptr, (int)b.idx);
     res.ref = &self->data[b.idx];
     if (!b.found) {
         _cx_memb(_insert_bucket_)(self, b);
-        ++self->size;
         res.inserted = true;
+        ++self->size;
     }
-    //printf("key %d: pos:%d, dist:%d\n", rkey, (int)b.idx, b.dist);
     return res;
 }
 
@@ -448,11 +440,7 @@ _cx_memb(_reserve)(_cx_self* self, const intptr_t _newcap) {
     if (_newcap != self->size && _newcap <= _oldbucks)
         return true;
     intptr_t _newbucks = (intptr_t)((float)_newcap / (i_max_load_factor)) + 4;
-    #if i_expandby == 2
-    _newbucks = (intptr_t)next_power_of_2(_newbucks);
-    #else
     _newbucks |= 1;
-    #endif
     _cx_self m = {
         (_cx_value *)i_malloc(_newbucks*c_sizeof(_cx_value)),
         (chash_slot *)i_calloc(_newbucks + 1, sizeof(chash_slot)),
@@ -482,23 +470,25 @@ _cx_memb(_erase_entry)(_cx_self* self, _cx_value* _val) {
     chash_slot* s = self->slot;
     intptr_t i = _val - d, j = i;
     const intptr_t _cap = self->bucket_count;
+
     _cx_memb(_value_drop)(_val);
     for (;;) { // delete with backward shifting
         if (++j == _cap) j = 0;
-        if (!s[j].dist) // empty slots has dist=0 too
+        if (! s[j].dist) // empty slots have dist==0 too
             break;
         d[i] = d[j];
         s[i] = s[j];
         --s[i].dist;
         i = j;
     }
-    s[j].hashx = 0;
+    s[i].dist = 0;
+    s[i].hashx = 0;
     --self->size;
 }
 
 #endif // i_implement
 #undef i_max_load_factor
-#undef i_expandby
+#undef i_sizebits
 #undef _i_isset
 #undef _i_ismap
 #undef _i_ishash

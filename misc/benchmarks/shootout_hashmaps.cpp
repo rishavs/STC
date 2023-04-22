@@ -2,7 +2,7 @@
 #include <time.h>
 #include <stc/crand.h>
 
-#define MAX_LOAD_FACTOR 85
+#define MAX_LOAD_FACTOR 82
 
 #ifdef __cplusplus
 #include <limits>
@@ -35,7 +35,7 @@ KHASH_MAP_INIT_INT64(ii, IValue)
 // cmap template expansion
 #define i_key IKey
 #define i_val IValue
-#define i_expandby 2 // enable 2^K buckets like the rest.
+//#define i_sizebits 64
 #define i_tag ii
 #define i_max_load_factor MAX_LOAD_FACTOR / 100.0f
 #include <stc/cmap.h>
