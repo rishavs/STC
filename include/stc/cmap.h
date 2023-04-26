@@ -21,10 +21,7 @@
  * SOFTWARE.
  */
 
-// Unordered set/map - implemented as closed hashing with linear probing and no tombstones.
-// https://programming.guide/robin-hood-hashing.html
-// https://www.sebastiansylvan.com/post/robin-hood-hashing-should-be-your-default-hash-table-implementation
-// Uses probe sequence lengths (dist)
+// Unordered set/map - implemented with robin hood algo with back shifting erase.
 /*
 #include <stdio.h>
 
@@ -56,6 +53,7 @@ int main(void) {
 #include "forward.h"
 #include <stdlib.h>
 #include <string.h>
+struct chash_slot { uint8_t hashx, dist; };
 typedef struct { intptr_t idx; uint8_t hashx, dist, found; } chash_bucket;
 #endif // CMAP_H_INCLUDED
 
@@ -76,8 +74,8 @@ typedef struct { intptr_t idx; uint8_t hashx, dist, found; } chash_bucket;
 #ifndef i_max_load_factor
   #define i_max_load_factor 0.82f
 #endif
-#ifndef i_sizebits
-  #define i_sizebits 32
+#ifndef i_expandby
+  #define i_expandby 2
 #endif
 #include "priv/template.h"
 #ifndef i_is_forward
@@ -249,7 +247,7 @@ _cx_memb(_find)(const _cx_self* self, _cx_keyraw rkey) {
 STC_INLINE const _cx_value*
 _cx_memb(_get)(const _cx_self* self, _cx_keyraw rkey) {
     chash_bucket b;
-    if (self->size && (b = _cx_memb(_bucket_)(self, &rkey)).found)    
+    if (self->size && (b = _cx_memb(_bucket_)(self, &rkey)).found)
         return self->data + b.idx;
     return NULL;
 }
@@ -288,20 +286,26 @@ _cx_memb(_eq)(const _cx_self* self, const _cx_self* other) {
 #if defined(i_implement)
 
 #ifndef CMAP_H_INCLUDED
-STC_INLINE int64_t fastrange_32(uint64_t x, uint64_t n)
-    { return (int64_t)((uint32_t)x*n >> 32); } // n < 2^31
+STC_INLINE int64_t fastrange_1(uint64_t x, uint64_t n)
+    { return (int64_t)((uint32_t)x*n >> 32); } // n < 2^32
 
-STC_INLINE int64_t fastrange_64(uint64_t x, uint64_t n) {
-    uint64_t lo, hi; c_umul128(x, n, &lo, &hi);
-    return (int64_t)hi;
+STC_INLINE int64_t fastrange_2(uint64_t x, uint64_t n) 
+    { return (int64_t)(x & (n - 1)); } // n power of 2.
+
+STC_INLINE uint64_t next_power_of_2(uint64_t n) {
+    n--;
+    n |= n >>  1, n |= n >>  2;
+    n |= n >>  4, n |= n >>  8;
+    n |= n >> 16, n |= n >> 32;
+    return n + 1;
 }
 #endif // CMAP_H_INCLUDED
 
 STC_DEF _cx_self
 _cx_memb(_with_capacity)(const intptr_t cap) {
-    _cx_self h = {0};
-    _cx_memb(_reserve)(&h, cap);
-    return h;
+    _cx_self map = {0};
+    _cx_memb(_reserve)(&map, cap);
+    return map;
 }
 
 STC_INLINE void _cx_memb(_wipe_)(_cx_self* self) {
@@ -359,9 +363,11 @@ STC_DEF chash_bucket
 _cx_memb(_bucket_)(const _cx_self* self, const _cx_keyraw* rkeyptr) {
     const uint64_t _hash = i_hash(rkeyptr);
     intptr_t _cap = self->bucket_count;
-    chash_bucket b = {c_PASTE(fastrange_,i_sizebits)(_hash, (uint64_t)_cap), (uint8_t)(_hash | 0x80)};
+    chash_bucket b = {c_PASTE(fastrange_,i_expandby)(_hash, (uint64_t)_cap), (uint8_t)(_hash | 0x80)};
     const chash_slot* s = self->slot;
-    while (s[b.idx].hashx && b.dist <= s[b.idx].dist) {
+    while (s[b.idx].hashx) {
+    	if (s[b.idx].dist < b.dist)
+    	    break; 
         if (s[b.idx].hashx == b.hashx) {
             const _cx_keyraw _raw = i_keyto(_i_keyref(self->data + b.idx));
             if (i_eq((&_raw), rkeyptr)) {
@@ -400,8 +406,8 @@ _cx_memb(_insert_bucket_)(_cx_self* self, chash_bucket b) {
 STC_DEF _cx_result
 _cx_memb(_insert_entry_)(_cx_self* self, _cx_keyraw rkey) {
     _cx_result res = {NULL};
-    if (self->size + 2 > (intptr_t)((float)self->bucket_count * (i_max_load_factor)))
-        if (!_cx_memb(_reserve)(self, (intptr_t)(self->size*3/2)))
+    if (self->size >= (intptr_t)((float)self->bucket_count * (i_max_load_factor)))
+        if (!_cx_memb(_reserve)(self, (intptr_t)(self->size*3/2 + 2)))
             return res;
 
     chash_bucket b = _cx_memb(_bucket_)(self, &rkey);
@@ -440,7 +446,11 @@ _cx_memb(_reserve)(_cx_self* self, const intptr_t _newcap) {
     if (_newcap != self->size && _newcap <= _oldbucks)
         return true;
     intptr_t _newbucks = (intptr_t)((float)_newcap / (i_max_load_factor)) + 4;
+    #if i_expandby == 2
+    _newbucks = (intptr_t)next_power_of_2(_newbucks);
+    #else
     _newbucks |= 1;
+    #endif
     _cx_self m = {
         (_cx_value *)i_malloc(_newbucks*c_sizeof(_cx_value)),
         (chash_slot *)i_calloc(_newbucks + 1, sizeof(chash_slot)),
@@ -488,7 +498,7 @@ _cx_memb(_erase_entry)(_cx_self* self, _cx_value* _val) {
 
 #endif // i_implement
 #undef i_max_load_factor
-#undef i_sizebits
+#undef i_expandby
 #undef _i_isset
 #undef _i_ismap
 #undef _i_ishash
